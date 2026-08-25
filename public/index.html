@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram Web</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background: #0e1621; color: #fff; height: 100vh; display: flex; overflow: hidden; }
+
+    /* Modal Auth */
+    #auth-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+    .auth-box { background: #17212b; padding: 30px; border-radius: 12px; width: 320px; text-align: center; border: 1px solid #242f3d; }
+    .auth-box h2 { margin-bottom: 20px; color: #5288c1; }
+    .auth-box input { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #242f3d; background: #0e1621; color: #fff; outline: none; }
+    .auth-box button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: #5288c1; color: #fff; font-weight: bold; cursor: pointer; }
+
+    /* Layout */
+    .sidebar { width: 320px; background: #17212b; border-right: 1px solid #0e1621; display: flex; flex-direction: column; }
+    .main-chat { flex: 1; background: #0e1621; display: flex; flex-direction: column; position: relative; }
+
+    /* Header */
+    .header { height: 60px; background: #17212b; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid #0e1621; }
+    .chat-title { font-weight: bold; font-size: 16px; }
+    .chat-subtitle { font-size: 12px; color: #7f91a4; margin-top: 2px; }
+
+    /* Chat List */
+    .chat-list { flex: 1; overflow-y: auto; }
+    .chat-item { padding: 14px 18px; display: flex; align-items: center; gap: 12px; cursor: pointer; border-bottom: 1px solid rgba(0,0,0,0.1); }
+    .chat-item:hover, .chat-item.active { background: #202b36; }
+    .avatar { width: 44px; height: 44px; border-radius: 50%; background: #5288c1; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; text-transform: uppercase; }
+    .chat-info { flex: 1; overflow: hidden; }
+    .chat-name { font-size: 15px; font-weight: 500; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-last { font-size: 13px; color: #7f91a4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Messages Feed */
+    .messages-container { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; background-image: radial-gradient(#17212b 1px, transparent 0); background-size: 16px 16px; }
+    .msg-bubble { max-width: 65%; padding: 8px 12px; border-radius: 12px; background: #182533; align-self: flex-start; position: relative; font-size: 14.5px; line-height: 1.4; word-break: break-word; }
+    .msg-bubble.own { align-self: flex-end; background: #2b5278; }
+    .msg-author { font-size: 12px; color: #e58a00; font-weight: 600; margin-bottom: 3px; }
+    .msg-bubble.own .msg-author { display: none; }
+    .msg-media img { max-width: 100%; max-height: 280px; border-radius: 8px; margin-top: 5px; cursor: pointer; }
+    .msg-meta { font-size: 11px; color: #7f91a4; text-align: right; margin-top: 4px; float: right; margin-left: 10px; }
+
+    /* Input Box */
+    .input-area { padding: 12px 20px; background: #17212b; display: flex; align-items: center; gap: 12px; }
+    .input-area input[type="text"] { flex: 1; padding: 12px 16px; border-radius: 20px; border: none; background: #0e1621; color: #fff; outline: none; font-size: 15px; }
+    .btn-icon { background: none; border: none; color: #7f91a4; cursor: pointer; font-size: 20px; padding: 6px; }
+    .btn-icon:hover { color: #5288c1; }
+    .btn-send { background: #5288c1; color: #fff; border: none; padding: 10px 18px; border-radius: 20px; font-weight: bold; cursor: pointer; }
+    #file-input { display: none; }
+    .action-bar { padding: 10px 16px; background: #17212b; border-bottom: 1px solid #0e1621; display: flex; justify-content: space-between; align-items: center; }
+  </style>
+</head>
+<body>
+
+  <div id="auth-modal">
+    <div class="auth-box">
+      <h2>Telegram</h2>
+      <input type="text" id="username-input" placeholder="Введите ваш никнейм..." autofocus>
+      <button onclick="login()">Войти в мессенджер</button>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="action-bar">
+      <span style="font-weight: bold; color: #5288c1;">Чаты</span>
+      <button class="btn-icon" onclick="createGroup()" title="Создать группу">+</button>
+    </div>
+    <div class="chat-list" id="chat-list"></div>
+  </div>
+
+  <div class="main-chat">
+    <div class="header">
+      <div>
+        <div class="chat-title" id="current-chat-title">Выберите чат</div>
+        <div class="chat-subtitle" id="current-chat-status"></div>
+      </div>
+    </div>
+
+    <div class="messages-container" id="messages-container"></div>
+
+    <div class="input-area">
+      <button class="btn-icon" onclick="document.getElementById('file-input').click()" title="Прикрепить фото">📎</button>
+      <input type="file" id="file-input" accept="image/*" onchange="uploadFile(this)">
+      <input type="text" id="message-input" placeholder="Напишите сообщение..." onkeypress="if(event.key==='Enter') sendMessage()">
+      <button class="btn-send" onclick="sendMessage()">Отправить</button>
+    </div>
+  </div>
+
+  <script>
+    let ws;
+    let currentUser = '';
+    let currentChatId = 'global';
+    let chats = [];
+    let messages = [];
+    let onlineUsers = [];
+    let selectedMediaUrl = null;
+
+    function login() {
+      const val = document.getElementById('username-input').value.trim();
+      if (!val) return;
+      currentUser = val;
+      document.getElementById('auth-modal').style.display = 'none';
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'auth', data: { username: currentUser } }));
+      };
+
+      ws.onmessage = (e) => {
+        const { type, data } = JSON.parse(e.data);
+        if (type === 'init') {
+          chats = data.chats;
+          messages = data.messages;
+          renderChats();
+          renderMessages();
+        } else if (type === 'new_message') {
+          messages.push(data);
+          renderMessages();
+          renderChats();
+        } else if (type === 'new_chat') {
+          chats.push(data);
+          renderChats();
+        } else if (type === 'online_users') {
+          onlineUsers = data;
+          updateStatus();
+        }
+      };
+    }
+
+    function renderChats() {
+      const el = document.getElementById('chat-list');
+      el.innerHTML = '';
+      chats.forEach(chat => {
+        const lastMsg = messages.filter(m => m.chatId === chat.id).pop();
+        const div = document.createElement('div');
+        div.className = `chat-item ${chat.id === currentChatId ? 'active' : ''}`;
+        div.onclick = () => selectChat(chat.id);
+        div.innerHTML = `
+          <div class="avatar">${chat.name[0]}</div>
+          <div class="chat-info">
+            <div class="chat-name">${chat.name}</div>
+            <div class="chat-last">${lastMsg ? `${lastMsg.sender}: ${lastMsg.text || '📷 Фотография'}` : 'Нет сообщений'}</div>
+          </div>
+        `;
+        el.appendChild(div);
+      });
+    }
+
+    function selectChat(id) {
+      currentChatId = id;
+      const chat = chats.find(c => c.id === id);
+      document.getElementById('current-chat-title').innerText = chat ? chat.name : 'Чат';
+      renderChats();
+      renderMessages();
+      updateStatus();
+    }
+
+    function updateStatus() {
+      document.getElementById('current-chat-status').innerText = `Онлайн участников: ${onlineUsers.length}`;
+    }
+
+    function renderMessages() {
+      const container = document.getElementById('messages-container');
+      container.innerHTML = '';
+      const list = messages.filter(m => m.chatId === currentChatId);
+
+      list.forEach(m => {
+        const isOwn = m.sender === currentUser;
+        const div = document.createElement('div');
+        div.className = `msg-bubble ${isOwn ? 'own' : ''}`;
+        div.innerHTML = `
+          <div class="msg-author">${m.sender}</div>
+          ${m.media ? `<div class="msg-media"><img src="${m.media}" onclick="window.open('${m.media}')"></div>` : ''}
+          <div>${escapeHtml(m.text)}</div>
+          <div class="msg-meta">${m.time}</div>
+        `;
+        container.appendChild(div);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function sendMessage() {
+      const input = document.getElementById('message-input');
+      const text = input.value.trim();
+      if (!text && !selectedMediaUrl) return;
+
+      ws.send(JSON.stringify({
+        type: 'message',
+        data: { chatId: currentChatId, text, media: selectedMediaUrl }
+      }));
+
+      input.value = '';
+      selectedMediaUrl = null;
+    }
+
+    async function uploadFile(input) {
+      const file = input.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: e.target.result, filename: file.name })
+        });
+        const data = await res.json();
+        if (data.url) {
+          selectedMediaUrl = data.url;
+          sendMessage();
+        }
+      };
+      reader.readAsDataURL(file);
+      input.value = '';
+    }
+
+    function createGroup() {
+      const name = prompt('Введите название новой группы:');
+      if (name && name.trim()) {
+        ws.send(JSON.stringify({ type: 'create_chat', data: { name: name.trim() } }));
+      }
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>
