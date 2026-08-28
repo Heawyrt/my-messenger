@@ -1,210 +1,271 @@
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
-const path = require('path');
-const fs = require('fs');
+const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const io = new Server(server, { maxHttpBufferSize: 1e8 });
 
-const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'database.json');
-const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+const SECRET_KEY = process.env.SECRET_KEY || 'wallchat_secret_key_change_me';
+const MONGO_URI = process.env.MONGO_URI || 'ВАША_СТРОКА_ПОДКЛЮЧЕНИЯ_MONGODB';
+const ADMINS = ['heawyrt', 'w1len'];
+const PASSWORD_REGEX = /^[a-zA-Zа-яА-ЯёЁ1-9]+$/;
 
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// 1. Подключение к MongoDB
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('Подключение к MongoDB успешно'))
+  .catch(err => console.error('Ошибка подключения к БД:', err));
+
+// 2. Схемы данных (Mongoose Schemas)
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  avatar: { type: String, default: null },
+  dob: { type: String, default: null },
+  friends: [{ type: String }],
+  friendRequests: [{ type: String }]
+});
+
+const groupSchema = new mongoose.Schema({
+  id: { type: String, unique: true, required: true },
+  name: { type: String, required: true },
+  createdBy: { type: String, required: true },
+  members: [{ type: String }]
+});
+
+const messageSchema = new mongoose.Schema({
+  id: { type: Number, required: true },
+  room: { type: String, required: true },
+  sender: { type: String, required: true },
+  avatar: { type: String, default: null },
+  isAdmin: { type: Boolean, default: false },
+  text: { type: String, default: '' },
+  image: { type: String, default: null },
+  time: { type: String, required: true },
+  replyTo: { type: Object, default: null },
+  reactions: { type: Map, of: [String], default: {} },
+  edited: { type: Boolean, default: false }
+});
+
+const User = mongoose.model('User', userSchema);
+const Group = mongoose.model('Group', groupSchema);
+const Message = mongoose.model('Message', messageSchema);
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static('public'));
+
+function isAdmin(username) {
+  return !!username && ADMINS.includes(username.toLowerCase());
 }
 
-let db = { 
-  chats: [{ id: 'global', name: '📢 Общий Канал', type: 'channel' }], 
-  messages: [], 
-  users: {} 
-};
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Токен отсутствует' });
 
-if (fs.existsSync(DB_FILE)) {
-  try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) {}
+  jwt.verify(token, SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Недействительный токен' });
+    req.user = user;
+    next();
+  });
 }
-
-function saveDB() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
-
-app.use(express.json({ limit: '20mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
 
 // Регистрация
 app.post('/api/register', async (req, res) => {
-  const { username, password } = req.body;
-  const cleanName = username ? username.trim() : '';
-
-  if (!cleanName || !password) {
-    return res.status(400).json({ error: 'Заполните логин и пароль' });
-  }
-  if (db.users[cleanName]) {
-    return res.status(400).json({ error: 'Пользователь уже существует' });
+  const { username, password, avatar, dob } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
+  if (password.length < 4 || password.length > 20 || !PASSWORD_REGEX.test(password)) {
+    return res.status(400).json({ error: 'Некорректный пароль' });
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
-  db.users[cleanName] = { passwordHash, avatar: null, createdAt: new Date().toISOString() };
-  saveDB();
+  const cleanName = username.trim();
+  const existingUser = await User.findOne({ username: cleanName });
+  if (existingUser) return res.status(400).json({ error: 'Пользователь уже существует' });
 
-  res.json({ ok: true, username: cleanName, avatar: null });
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const user = await User.create({
+    username: cleanName,
+    password: hashedPassword,
+    avatar: avatar || null,
+    dob: dob || null,
+    friends: [],
+    friendRequests: []
+  });
+
+  const token = jwt.sign({ username: cleanName }, SECRET_KEY);
+  res.json({ token, username: cleanName, avatar: user.avatar, dob: user.dob, isAdmin: isAdmin(cleanName) });
 });
 
-// Авторизация
+// Вход
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  const cleanName = username ? username.trim() : '';
-  const user = db.users[cleanName];
+  const cleanName = (username || '').trim();
+  const user = await User.findOne({ username: cleanName });
 
-  if (!user || !user.passwordHash) {
-    return res.status(400).json({ error: 'Пользователь не найден' });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(400).json({ error: 'Неверное имя или пароль' });
   }
 
-  const isValid = await bcrypt.compare(password, user.passwordHash);
-  if (!isValid) {
-    return res.status(400).json({ error: 'Неверный пароль' });
-  }
-
-  res.json({ ok: true, username: cleanName, avatar: user.avatar || null });
+  const token = jwt.sign({ username: cleanName }, SECRET_KEY);
+  res.json({ token, username: cleanName, avatar: user.avatar, dob: user.dob, isAdmin: isAdmin(cleanName) });
 });
 
-// Общий эндпоинт загрузки файлов (фотографии из памяти устройства)
-app.post('/api/upload', (req, res) => {
-  const { image, filename } = req.body;
-  if (!image) return res.status(400).json({ error: 'Файл не выбран' });
+// Данные профиля
+app.get('/api/me', authenticateToken, async (req, res) => {
+  const user = await User.findOne({ username: req.user.username });
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
 
-  try {
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    const ext = filename ? path.extname(filename) : '.png';
-    const newFileName = `avatar_${Date.now()}_${Math.random().toString(36).substr(2, 5)}${ext}`;
-    const filePath = path.join(UPLOADS_DIR, newFileName);
+  const friendsList = await User.find({ username: { $in: user.friends } }, 'username avatar');
+  const requestsList = await User.find({ username: { $in: user.friendRequests } }, 'username avatar');
+  const userGroupsRaw = await Group.find({ members: req.user.username });
 
-    fs.writeFile(filePath, base64Data, 'base64', (err) => {
-      if (err) return res.status(500).json({ error: 'Ошибка сохранения файла на диске' });
-      res.json({ url: `/uploads/${newFileName}` });
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Некорректный формат файла' });
-  }
+  const groupsList = await Promise.all(userGroupsRaw.map(async (g) => {
+    const membersData = await User.find({ username: { $in: g.members } }, 'username avatar');
+    return {
+      id: g.id,
+      name: g.name,
+      createdBy: g.createdBy,
+      isFounder: g.createdBy === req.user.username,
+      members: membersData.map(m => ({
+        username: m.username,
+        avatar: m.avatar,
+        isFounder: m.username === g.createdBy,
+        isAdmin: isAdmin(m.username)
+      }))
+    };
+  }));
+
+  res.json({
+    username: user.username,
+    avatar: user.avatar,
+    dob: user.dob,
+    isAdmin: isAdmin(user.username),
+    friends: friendsList.map(f => ({ username: f.username, avatar: f.avatar, isAdmin: isAdmin(f.username) })),
+    friendRequests: requestsList.map(r => ({ username: r.username, avatar: r.avatar, isAdmin: isAdmin(r.username) })),
+    groups: groupsList
+  });
 });
 
-// Загрузка аватарки напрямую из памяти устройства
-app.post('/api/update-avatar', (req, res) => {
-  const { username, avatarUrl } = req.body;
-  if (!username || !db.users[username]) {
-    return res.status(400).json({ error: 'Пользователь не найден' });
-  }
+// Заявка в друзья
+app.post('/api/friends/request', authenticateToken, async (req, res) => {
+  const { targetUsername } = req.body;
+  const senderName = req.user.username;
+  const targetName = (targetUsername || '').trim();
 
-  db.users[username].avatar = avatarUrl;
-  saveDB();
+  if (senderName === targetName) return res.status(400).json({ error: 'Нельзя добавить самого себя' });
+  const targetUser = await User.findOne({ username: targetName });
+  if (!targetUser) return res.status(404).json({ error: 'Пользователь не найден' });
 
-  // Рассылка новым фото всем подключенным веб-сокетам
-  broadcast({ type: 'user_updated', data: { username, avatar: avatarUrl } });
+  const senderUser = await User.findOne({ username: senderName });
+  if (senderUser.friends.includes(targetName)) return res.status(400).json({ error: 'Уже в друзьях' });
+  if (targetUser.friendRequests.includes(senderName)) return res.status(400).json({ error: 'Заявка уже отправлена' });
 
-  res.json({ ok: true, avatar: avatarUrl });
+  targetUser.friendRequests.push(senderName);
+  await targetUser.save();
+  res.json({ success: true, message: `Заявка отправлена пользователю ${targetName}` });
 });
 
-const clients = new Map();
+// Принять заявку
+app.post('/api/friends/accept', authenticateToken, async (req, res) => {
+  const { requesterUsername } = req.body;
+  const user = await User.findOne({ username: req.user.username });
+  const requester = await User.findOne({ username: requesterUsername });
 
-wss.on('connection', (ws) => {
-  let currentUser = null;
+  if (!user || !requester) return res.status(404).json({ error: 'Пользователь не найден' });
 
-  ws.on('message', (raw) => {
+  user.friendRequests = user.friendRequests.filter(name => name !== requesterUsername);
+  if (!user.friends.includes(requesterUsername)) user.friends.push(requesterUsername);
+  if (!requester.friends.includes(req.user.username)) requester.friends.push(req.user.username);
+
+  await user.save();
+  await requester.save();
+  res.json({ success: true });
+});
+
+// Создать группу
+app.post('/api/groups/create', authenticateToken, async (req, res) => {
+  const { groupName, memberUsernames } = req.body;
+  const creator = req.user.username;
+  if (!groupName || !groupName.trim()) return res.status(400).json({ error: 'Укажите название группы' });
+
+  const creatorUser = await User.findOne({ username: creator });
+  const membersSet = new Set([creator]);
+  if (Array.isArray(memberUsernames)) {
+    memberUsernames.forEach(m => { if (creatorUser.friends.includes(m)) membersSet.add(m); });
+  }
+
+  const groupId = 'group_' + Date.now();
+  const group = await Group.create({ id: groupId, name: groupName.trim(), createdBy: creator, members: Array.from(membersSet) });
+  res.json({ success: true, group });
+});
+
+// Вспомогательная функция комнат
+function getRoomId(chatType, targetId, username) {
+  if (chatType === 'saved') return 'saved_' + username;
+  if (chatType === 'suggestions' && isAdmin(username)) return 'suggestions_room';
+  if (chatType === 'dm') return [username, targetId].sort().join('_');
+  if (chatType === 'group') return targetId;
+  return null;
+}
+
+// Socket.io работа с базой сообщений
+io.on('connection', (socket) => {
+  socket.on('join_room', async ({ token, chatType, targetId }) => {
     try {
-      const { type, data } = JSON.parse(raw);
+      const decoded = jwt.verify(token, SECRET_KEY);
+      const room = getRoomId(chatType, targetId, decoded.username);
+      if (room) {
+        if (socket.currentRoom) socket.leave(socket.currentRoom);
+        socket.join(room);
+        socket.currentRoom = room;
 
-      if (type === 'auth') {
-        currentUser = data.username.trim();
-        clients.set(ws, currentUser);
-
-        const userSavedChat = { id: `saved_${currentUser}`, name: '🔖 Избранное', type: 'saved' };
-        const userChats = [userSavedChat, ...db.chats];
-
-        const userMessages = db.messages.filter(m => {
-          if (m.chatId.startsWith('saved_')) return m.chatId === `saved_${currentUser}`;
-          return true;
-        });
-
-        const usersMap = {};
-        for (let u in db.users) {
-          usersMap[u] = { avatar: db.users[u].avatar };
-        }
-
-        ws.send(JSON.stringify({
-          type: 'init',
-          data: {
-            chats: userChats,
-            messages: userMessages,
-            users: usersMap,
-            user: { username: currentUser, avatar: db.users[currentUser]?.avatar || null }
-          }
-        }));
-
-        broadcastUsers();
-      }
-
-      if (type === 'message' && currentUser) {
-        const chatId = data.chatId || 'global';
-        if (chatId.startsWith('saved_') && chatId !== `saved_${currentUser}`) return;
-
-        const msg = {
-          id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
-          chatId: chatId,
-          sender: currentUser,
-          text: data.text || '',
-          media: data.media || null,
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          date: new Date().toISOString()
-        };
-
-        db.messages.push(msg);
-        saveDB();
-
-        if (chatId.startsWith('saved_')) {
-          ws.send(JSON.stringify({ type: 'new_message', data: msg }));
-        } else {
-          broadcast({ type: 'new_message', data: msg });
-        }
-      }
-
-      if (type === 'create_chat' && currentUser) {
-        const newChat = {
-          id: 'chat_' + Date.now(),
-          name: data.name,
-          type: 'group'
-        };
-        db.chats.push(newChat);
-        saveDB();
-        broadcast({ type: 'new_chat', data: newChat });
+        const history = await Message.find({ room }).sort({ id: 1 });
+        socket.emit('chat_history', history);
       }
     } catch (e) { console.error(e); }
   });
 
-  ws.on('close', () => {
-    if (currentUser) {
-      clients.delete(ws);
-      broadcastUsers();
-    }
+  socket.on('send_message', async ({ token, chatType, targetId, text, image, replyTo }) => {
+    try {
+      const decoded = jwt.verify(token, SECRET_KEY);
+      const senderUser = await User.findOne({ username: decoded.username });
+      if (!senderUser) return;
+
+      const room = getRoomId(chatType, targetId, decoded.username);
+      if (room) {
+        const msgData = await Message.create({
+          id: Date.now() + Math.random(),
+          room,
+          sender: decoded.username,
+          avatar: senderUser.avatar,
+          isAdmin: isAdmin(decoded.username),
+          text: text || '',
+          image: image || null,
+          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          replyTo: replyTo || null,
+          reactions: {}
+        });
+
+        io.to(room).emit('new_message', msgData);
+      }
+    } catch (e) { console.error(e); }
+  });
+
+  socket.on('delete_messages', async ({ token, chatType, targetId, messageIds }) => {
+    try {
+      const decoded = jwt.verify(token, SECRET_KEY);
+      const room = getRoomId(chatType, targetId, decoded.username);
+      if (room) {
+        await Message.deleteMany({ id: { $in: messageIds }, sender: decoded.username, room });
+        const updatedHistory = await Message.find({ room }).sort({ id: 1 });
+        io.to(room).emit('chat_history', updatedHistory);
+      }
+    } catch (e) { console.error(e); }
   });
 });
 
-function broadcast(payload) {
-  const str = JSON.stringify(payload);
-  for (const [ws] of clients.keys()) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(str);
-  }
-}
-
-function broadcastUsers() {
-  const online = Array.from(clients.values());
-  broadcast({ type: 'online_users', data: online });
-}
-
-server.listen(PORT, () => {
-  console.log(`\n==================================================`);
-  console.log(`🚀 Wallchat запущен на http://localhost:${PORT}`);
-  console.log(`==================================================\n`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Wallchat запущен на порту ${PORT}`));
